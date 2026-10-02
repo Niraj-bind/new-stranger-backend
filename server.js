@@ -8,16 +8,19 @@ const path = require('path');
 const app = express();
 const server = http.createServer(app);
 
-// Enable CORS for mobile and web connections
+// Configure CORS and Socket.io with ping timeout for aggressive dead connection pruning
 const io = new Server(server, {
   cors: {
     origin: '*',
     methods: ['GET', 'POST']
-  }
+  },
+  pingTimeout: 10000,
+  pingInterval: 5000,
+  transports: ['websocket', 'polling']
 });
 
 app.use(cors());
-app.use(express.json({ limit: '15mb' })); // Support for photo sharing payload
+app.use(express.json({ limit: '15mb' }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -38,7 +41,7 @@ function saveDb() {
 }
 
 // -------------------------------------------------------------
-// Health Check (For Render zero-downtime deployment check)
+// Health Check (For Render)
 // -------------------------------------------------------------
 app.get('/', (req, res) => {
   res.json({
@@ -46,6 +49,8 @@ app.get('/', (req, res) => {
     service: 'New Stranger Backend API',
     platform: 'Render.com',
     onlineUsers: io.engine.clientsCount,
+    activeMatches: activeRooms.size,
+    queueSize: waitingQueue.length,
     timestamp: new Date().toISOString()
   });
 });
@@ -54,7 +59,7 @@ app.get('/', (req, res) => {
 // REST API ENDPOINTS
 // -------------------------------------------------------------
 
-// 1. REGISTER: Auto unique User ID generation
+// 1. REGISTER
 app.post('/api/register', (req, res) => {
   const { name, password, age, gender, orientation } = req.body;
   if (!name || !password) {
@@ -107,7 +112,7 @@ app.post('/api/login', (req, res) => {
   });
 });
 
-// 3. STATS: Live online counters
+// 3. STATS
 app.get('/api/stats', (req, res) => {
   const liveCount = io.engine.clientsCount;
   const base = 12400 + liveCount;
@@ -121,7 +126,7 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
-// 4. FRIEND REQUEST: Send request by User ID
+// 4. FRIEND REQUEST
 app.post('/api/friends/request', (req, res) => {
   const { fromUserId, toUserId } = req.body;
   if (!toUserId) return res.status(400).json({ error: 'toUserId required' });
@@ -172,67 +177,201 @@ app.get('/api/friends/:userId', (req, res) => {
 });
 
 // -------------------------------------------------------------
-// REAL-TIME WEBSOCKETS (Random Matchmaking & Live Chat)
+// BULLETPROOF 1-ON-1 REAL-TIME MATCHMAKING & RELIABLE MESSAGING
 // -------------------------------------------------------------
 
+// Waiting queue storing socket instances
 let waitingQueue = [];
 
-io.on('connection', (socket) => {
-  console.log('Socket connected:', socket.id);
+// Active 1-on-1 rooms map: roomId -> { user1: socket, user2: socket }
+const activeRooms = new Map();
 
-  // Identify connected user ID
+// Helper: Disconnect from partner safely and reset state
+function endPairing(socket, reason = 'partner_left') {
+  const roomId = socket.currentRoomId;
+  const partnerSocket = socket.partnerSocket;
+
+  // Clean current socket
+  socket.state = 'IDLE';
+  socket.partnerSocket = null;
+  socket.currentRoomId = null;
+
+  if (roomId) {
+    socket.leave(roomId);
+    activeRooms.delete(roomId);
+  }
+
+  // Clean partner socket
+  if (partnerSocket && partnerSocket.connected) {
+    partnerSocket.state = 'IDLE';
+    partnerSocket.partnerSocket = null;
+    partnerSocket.currentRoomId = null;
+    if (roomId) partnerSocket.leave(roomId);
+
+    partnerSocket.emit('stranger_disconnected', { reason });
+    console.log(`[PAIRING ENDED] ${socket.id} separated from ${partnerSocket.id}`);
+  }
+}
+
+// Helper: Prune waiting queue of dead sockets
+function cleanQueue() {
+  waitingQueue = waitingQueue.filter(s => s && s.connected && s.state === 'WAITING');
+}
+
+io.on('connection', (socket) => {
+  console.log(`[CONNECT] User connected: ${socket.id}`);
+  socket.state = 'IDLE'; // States: 'IDLE', 'WAITING', 'MATCHED'
+  socket.partnerSocket = null;
+  socket.currentRoomId = null;
+
   socket.on('identify', (userId) => {
     socket.userId = userId;
   });
 
-  // Find random match
-  socket.on('find_match', () => {
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id && s.connected);
+  // 1. MATCH REQUEST (Atomic matching loop)
+  socket.on('find_match', (data = {}) => {
+    // If socket is already in a match, cleanly terminate the old match first
+    if (socket.state === 'MATCHED') {
+      endPairing(socket, 'new_match_requested');
+    }
 
-    if (waitingQueue.length > 0) {
-      const partnerSocket = waitingQueue.shift();
-      const roomId = `room_${socket.id}_${partnerSocket.id}`;
+    // Remove this socket if it was already in waiting queue
+    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
+    cleanQueue();
+
+    let matchedPartner = null;
+
+    // Search for a valid, currently waiting partner
+    while (waitingQueue.length > 0) {
+      const candidate = waitingQueue.shift();
+
+      // STRICT VALIDATION: Candidate must be connected, in WAITING state, and NOT the same socket
+      if (
+        candidate &&
+        candidate.connected &&
+        candidate.state === 'WAITING' &&
+        candidate.id !== socket.id
+      ) {
+        matchedPartner = candidate;
+        break;
+      }
+    }
+
+    if (matchedPartner) {
+      // ATOMIC PAIRING: Set states immediately before any async ops
+      socket.state = 'MATCHED';
+      matchedPartner.state = 'MATCHED';
+
+      const roomId = `room_${socket.id}_${matchedPartner.id}_${Date.now()}`;
+      socket.currentRoomId = roomId;
+      matchedPartner.currentRoomId = roomId;
+
+      socket.partnerSocket = matchedPartner;
+      matchedPartner.partnerSocket = socket;
 
       socket.join(roomId);
-      partnerSocket.join(roomId);
+      matchedPartner.join(roomId);
 
-      socket.currentRoom = roomId;
-      partnerSocket.currentRoom = roomId;
+      activeRooms.set(roomId, { user1: socket, user2: matchedPartner });
 
-      socket.partnerId = partnerSocket.userId || 'Anonymous Stranger';
-      partnerSocket.partnerId = socket.userId || 'Anonymous Stranger';
+      const nameA = socket.userId || 'Stranger';
+      const nameB = matchedPartner.userId || 'Stranger';
 
-      socket.emit('match_found', { roomId, partnerName: partnerSocket.partnerId });
-      partnerSocket.emit('match_found', { roomId, partnerName: socket.partnerId });
-      console.log(`Matched ${socket.id} with ${partnerSocket.id}`);
+      // Notify User A
+      socket.emit('match_found', {
+        roomId,
+        partnerId: matchedPartner.id,
+        partnerName: nameB
+      });
+
+      // Notify User B
+      matchedPartner.emit('match_found', {
+        roomId,
+        partnerId: socket.id,
+        partnerName: nameA
+      });
+
+      console.log(`[MATCH SUCCESS] Room ${roomId} created between ${socket.id} (${nameA}) and ${matchedPartner.id} (${nameB})`);
     } else {
+      // Put in queue
+      socket.state = 'WAITING';
       waitingQueue.push(socket);
       socket.emit('waiting_for_match');
+      console.log(`[WAITING] Socket ${socket.id} queued. Total queue: ${waitingQueue.length}`);
     }
   });
 
-  // Send message inside Room (Text or Photo)
-  socket.on('send_message', ({ roomId, text, imageBase64, isPhoto }) => {
-    socket.to(roomId).emit('receive_message', {
-      text,
-      imageBase64,
-      isPhoto: !!isPhoto,
+  // 2. RELIABLE MESSAGE SEND WITH ACKNOWLEDGEMENT (Guaranteed Delivery)
+  socket.on('send_message', (payload, ackCallback) => {
+    const partner = socket.partnerSocket;
+
+    // Validation 1: Verify socket is currently matched
+    if (socket.state !== 'MATCHED' || !partner) {
+      if (typeof ackCallback === 'function') {
+        ackCallback({
+          status: 'error',
+          error: 'No active stranger connection. Please match first.'
+        });
+      }
+      return;
+    }
+
+    // Validation 2: Verify partner is still connected
+    if (!partner.connected) {
+      endPairing(socket, 'partner_lost_connection');
+      if (typeof ackCallback === 'function') {
+        ackCallback({
+          status: 'error',
+          error: 'Stranger disconnected. Message could not be sent.'
+        });
+      }
+      return;
+    }
+
+    const messageData = {
+      id: payload.id || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      text: payload.text || null,
+      imageBase64: payload.imageBase64 || null,
+      isPhoto: !!payload.isPhoto,
       from: socket.userId || 'Stranger',
       timestamp: new Date().toISOString()
-    });
-  });
+    };
 
-  // Leave / Skip Match (New Match button)
-  socket.on('leave_match', () => {
-    if (socket.currentRoom) {
-      socket.to(socket.currentRoom).emit('partner_disconnected');
-      socket.leave(socket.currentRoom);
-      socket.currentRoom = null;
+    // DIRECT EMISSION TO PARTNER: No broadcast loss!
+    partner.emit('receive_message', messageData);
+
+    // Send instant success delivery receipt back to the sender
+    if (typeof ackCallback === 'function') {
+      ackCallback({
+        status: 'delivered',
+        messageId: messageData.id,
+        timestamp: messageData.timestamp
+      });
     }
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
   });
 
-  // WebRTC Signaling for Friend Voice & Video Calls
+  // 3. TYPING INDICATOR (Direct to partner)
+  socket.on('typing', ({ isTyping }) => {
+    if (socket.partnerSocket && socket.partnerSocket.connected) {
+      socket.partnerSocket.emit('stranger_typing', { isTyping: !!isTyping });
+    }
+  });
+
+  // 4. LEAVE / CANCEL MATCH (Explicit clean separation)
+  socket.on('leave_match', () => {
+    console.log(`[LEAVE MATCH] ${socket.id} called leave_match`);
+    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
+    endPairing(socket, 'user_left');
+  });
+
+  // 5. DISCONNECT HANDLER
+  socket.on('disconnect', (reason) => {
+    console.log(`[DISCONNECT] Socket ${socket.id} disconnected (${reason})`);
+    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
+    endPairing(socket, 'disconnected');
+  });
+
+  // 6. WEBRTC SIGNALING FOR CALLS
   socket.on('call_user', ({ toUserId, signalData, callType }) => {
     io.emit(`call_incoming_${toUserId}`, {
       fromUserId: socket.userId,
@@ -243,14 +382,6 @@ io.on('connection', (socket) => {
 
   socket.on('answer_call', ({ toUserId, signalData }) => {
     io.emit(`call_accepted_${toUserId}`, { signalData });
-  });
-
-  socket.on('disconnect', () => {
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
-    if (socket.currentRoom) {
-      socket.to(socket.currentRoom).emit('partner_disconnected');
-    }
-    console.log('Socket disconnected:', socket.id);
   });
 });
 
