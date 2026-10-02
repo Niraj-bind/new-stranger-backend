@@ -270,15 +270,20 @@ io.on('connection', (socket) => {
   socket.currentRoomId = null;
 
   socket.on('identify', (data) => {
+    let uId = '';
+    let uGender = 'Male';
     if (typeof data === 'string') {
-      socket.userId = data;
+      uId = data;
       if (db.users[data]) {
-        socket.userGender = db.users[data].gender;
+        uGender = db.users[data].gender;
       }
     } else if (data && typeof data === 'object') {
-      socket.userId = data.userId;
-      socket.userGender = data.gender || (db.users[data.userId] ? db.users[data.userId].gender : 'Male');
+      uId = data.userId || '';
+      uGender = data.gender || (db.users[uId] ? db.users[uId].gender : 'Male');
     }
+    socket.userId = (uId || '').toUpperCase();
+    socket.userGender = uGender;
+    socket.join(`user_${socket.userId}`);
     console.log(`[IDENTIFY] Socket ${socket.id} is ${socket.userId} (${socket.userGender})`);
   });
 
@@ -436,6 +441,37 @@ io.on('connection', (socket) => {
 
   socket.on('answer_call', ({ toUserId, signalData }) => {
     io.emit(`call_accepted_${toUserId}`, { signalData });
+  });
+
+  // 7. DIRECT FRIEND-TO-FRIEND MESSAGING
+  socket.on('send_friend_message', (payload, ackCallback) => {
+    const toUserId = (payload.toUserId || '').trim().toUpperCase();
+    if (!toUserId) {
+      if (typeof ackCallback === 'function') {
+        ackCallback({ status: 'error', error: 'Recipient ID required' });
+      }
+      return;
+    }
+
+    const messageData = {
+      id: payload.id || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      text: payload.text || null,
+      imageBase64: payload.imageBase64 || null,
+      isPhoto: !!payload.isPhoto,
+      from: socket.userId || 'Friend',
+      toUserId: toUserId,
+      timestamp: new Date().toISOString()
+    };
+
+    io.to(`user_${toUserId}`).emit('receive_friend_message', messageData);
+    console.log(`[FRIEND MSG] From ${socket.userId} to ${toUserId} (ID: ${messageData.id})`);
+
+    if (typeof ackCallback === 'function') {
+      ackCallback({
+        status: 'delivered',
+        messageId: messageData.id
+      });
+    }
   });
 });
 
