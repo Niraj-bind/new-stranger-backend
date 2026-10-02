@@ -212,10 +212,30 @@ app.get('/api/stats', (req, res) => {
 app.post('/api/friends/request', (req, res) => {
   const fromUserId = (req.body.fromUserId || '').trim().toUpperCase();
   const toUserId = (req.body.toUserId || '').trim().toUpperCase();
-  if (!toUserId) return res.status(400).json({ error: 'toUserId required' });
 
+  if (!fromUserId || !toUserId) {
+    return res.status(400).json({ error: 'fromUserId and toUserId are required' });
+  }
+
+  if (fromUserId === toUserId) {
+    return res.status(400).json({ error: 'Aap khud ko friend request nahi bhej sakte' });
+  }
+
+  // Ensure structures exist for both users (handles server restart/ephemeral container)
+  if (!db.users[fromUserId]) {
+    db.users[fromUserId] = { id: fromUserId, name: fromUserId, gender: 'Other' };
+    db.friends[fromUserId] = db.friends[fromUserId] || [];
+    db.requests[fromUserId] = db.requests[fromUserId] || [];
+  }
   if (!db.users[toUserId]) {
-    return res.status(404).json({ error: `User ID '${toUserId}' not found` });
+    db.users[toUserId] = { id: toUserId, name: toUserId, gender: 'Other' };
+    db.friends[toUserId] = db.friends[toUserId] || [];
+    db.requests[toUserId] = db.requests[toUserId] || [];
+  }
+
+  db.friends[fromUserId] = db.friends[fromUserId] || [];
+  if (db.friends[fromUserId].includes(toUserId)) {
+    return res.status(400).json({ error: `${toUserId} already aapka friend hai` });
   }
 
   db.requests[toUserId] = db.requests[toUserId] || [];
@@ -224,13 +244,25 @@ app.post('/api/friends/request', (req, res) => {
     saveDb();
   }
 
-  return res.json({ success: true, message: `Request sent to ${toUserId}` });
+  // Real-time socket event to the recipient's phone!
+  io.to(`user_${toUserId}`).emit('incoming_friend_request', { fromUserId });
+  console.log(`[FRIEND REQUEST] ${fromUserId} -> ${toUserId}`);
+
+  return res.json({ success: true, message: `Friend request bhej di gayi: ${toUserId} 🚀` });
 });
 
 // 5. ACCEPT REQUEST
 app.post('/api/friends/accept', (req, res) => {
   const userId = (req.body.userId || '').trim().toUpperCase();
   const targetId = (req.body.targetId || '').trim().toUpperCase();
+
+  if (!userId || !targetId) {
+    return res.status(400).json({ error: 'userId and targetId are required' });
+  }
+
+  // Ensure structures exist
+  if (!db.users[userId]) db.users[userId] = { id: userId, name: userId };
+  if (!db.users[targetId]) db.users[targetId] = { id: targetId, name: targetId };
 
   db.requests[userId] = (db.requests[userId] || []).filter(id => id !== targetId);
   db.friends[userId] = db.friends[userId] || [];
@@ -240,6 +272,12 @@ app.post('/api/friends/accept', (req, res) => {
   if (!db.friends[targetId].includes(userId)) db.friends[targetId].push(userId);
 
   saveDb();
+
+  // Real-time socket events to both phones!
+  io.to(`user_${userId}`).emit('friend_accepted', { friendId: targetId });
+  io.to(`user_${targetId}`).emit('friend_accepted', { friendId: userId });
+
+  console.log(`[FRIEND ACCEPTED] ${userId} <-> ${targetId}`);
   return res.json({ success: true, friends: db.friends[userId] });
 });
 
@@ -247,14 +285,24 @@ app.post('/api/friends/accept', (req, res) => {
 app.post('/api/friends/decline', (req, res) => {
   const userId = (req.body.userId || '').trim().toUpperCase();
   const targetId = (req.body.targetId || '').trim().toUpperCase();
-  db.requests[userId] = (db.requests[userId] || []).filter(id => id !== targetId);
-  saveDb();
+
+  if (userId) {
+    db.requests[userId] = (db.requests[userId] || []).filter(id => id !== targetId);
+    saveDb();
+  }
+
   return res.json({ success: true, message: 'Request declined' });
 });
 
 // 7. GET FRIENDS & REQUESTS
 app.get('/api/friends/:userId', (req, res) => {
   const userId = (req.params.userId || '').trim().toUpperCase();
+  if (userId && !db.users[userId]) {
+    db.users[userId] = { id: userId, name: userId };
+    db.friends[userId] = db.friends[userId] || [];
+    db.requests[userId] = db.requests[userId] || [];
+  }
+
   return res.json({
     friends: db.friends[userId] || [],
     incomingRequests: db.requests[userId] || []
@@ -324,6 +372,19 @@ io.on('connection', (socket) => {
     socket.userId = (uId || '').toUpperCase();
     socket.userGender = uGender;
     socket.join(`user_${socket.userId}`);
+
+    if (socket.userId && !db.users[socket.userId]) {
+      db.users[socket.userId] = {
+        id: socket.userId,
+        name: socket.userId,
+        gender: socket.userGender,
+        createdAt: new Date().toISOString()
+      };
+      db.friends[socket.userId] = db.friends[socket.userId] || [];
+      db.requests[socket.userId] = db.requests[socket.userId] || [];
+      saveDb();
+    }
+
     console.log(`[IDENTIFY] Socket ${socket.id} is ${socket.userId} (${socket.userGender})`);
   });
 
