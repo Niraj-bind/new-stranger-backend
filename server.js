@@ -73,6 +73,18 @@ app.get('/api/config', (req, res) => {
 // REST API ENDPOINTS
 // -------------------------------------------------------------
 
+function generateUniqueUserId() {
+  const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  let id = '';
+  do {
+    id = '';
+    for (let i = 0; i < 6; i++) {
+      id += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+  } while (db.users[id]);
+  return id;
+}
+
 // 1. REGISTER
 app.post('/api/register', (req, res) => {
   const { name, password, age, gender, orientation } = req.body;
@@ -80,8 +92,7 @@ app.post('/api/register', (req, res) => {
     return res.status(400).json({ error: 'Name and password are required' });
   }
 
-  const uniqueNum = Math.floor(10000 + Math.random() * 90000);
-  const userId = `stranger_${uniqueNum}`;
+  const userId = generateUniqueUserId();
 
   db.users[userId] = {
     id: userId,
@@ -97,6 +108,8 @@ app.post('/api/register', (req, res) => {
   db.requests[userId] = [];
   saveDb();
 
+  console.log(`[REGISTER] Created user ${userId} (${name})`);
+
   return res.json({
     success: true,
     message: 'User registered successfully',
@@ -108,7 +121,10 @@ app.post('/api/register', (req, res) => {
 // 2. LOGIN
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
-  const user = db.users[username];
+  if (!username) return res.status(400).json({ error: 'Username is required' });
+  const rawId = username.trim();
+  const upperId = rawId.toUpperCase();
+  const user = db.users[upperId] || db.users[rawId];
 
   if (!user || user.password !== password) {
     return res.status(401).json({ error: 'Invalid User ID or Password' });
@@ -154,11 +170,12 @@ app.get('/api/stats', (req, res) => {
 
 // 4. FRIEND REQUEST
 app.post('/api/friends/request', (req, res) => {
-  const { fromUserId, toUserId } = req.body;
+  const fromUserId = (req.body.fromUserId || '').trim().toUpperCase();
+  const toUserId = (req.body.toUserId || '').trim().toUpperCase();
   if (!toUserId) return res.status(400).json({ error: 'toUserId required' });
 
   if (!db.users[toUserId]) {
-    return res.status(404).json({ error: 'Target User ID not found' });
+    return res.status(404).json({ error: `User ID '${toUserId}' not found` });
   }
 
   db.requests[toUserId] = db.requests[toUserId] || [];
@@ -172,7 +189,8 @@ app.post('/api/friends/request', (req, res) => {
 
 // 5. ACCEPT REQUEST
 app.post('/api/friends/accept', (req, res) => {
-  const { userId, targetId } = req.body;
+  const userId = (req.body.userId || '').trim().toUpperCase();
+  const targetId = (req.body.targetId || '').trim().toUpperCase();
 
   db.requests[userId] = (db.requests[userId] || []).filter(id => id !== targetId);
   db.friends[userId] = db.friends[userId] || [];
@@ -187,7 +205,8 @@ app.post('/api/friends/accept', (req, res) => {
 
 // 6. DECLINE REQUEST
 app.post('/api/friends/decline', (req, res) => {
-  const { userId, targetId } = req.body;
+  const userId = (req.body.userId || '').trim().toUpperCase();
+  const targetId = (req.body.targetId || '').trim().toUpperCase();
   db.requests[userId] = (db.requests[userId] || []).filter(id => id !== targetId);
   saveDb();
   return res.json({ success: true, message: 'Request declined' });
@@ -195,7 +214,7 @@ app.post('/api/friends/decline', (req, res) => {
 
 // 7. GET FRIENDS & REQUESTS
 app.get('/api/friends/:userId', (req, res) => {
-  const { userId } = req.params;
+  const userId = (req.params.userId || '').trim().toUpperCase();
   return res.json({
     friends: db.friends[userId] || [],
     incomingRequests: db.requests[userId] || []
