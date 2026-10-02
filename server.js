@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const { RtcTokenBuilder, RtcRole } = require('agora-token');
 
 const app = express();
 const server = http.createServer(app);
@@ -13,6 +14,7 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 const AGORA_APP_ID = process.env.AGORA_APP_ID || '8fad472fea6c40dcaf4bd00b394ad814';
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || '';
 const APP_SECRET = process.env.APP_SECRET || 'new_stranger_secret_key_2026';
 
 // Configure CORS and Socket.io with ping timeout for aggressive dead connection pruning
@@ -67,6 +69,44 @@ app.get('/api/config', (req, res) => {
     agoraAppId: AGORA_APP_ID,
     environment: NODE_ENV
   });
+});
+
+// 8. AGORA RTC TOKEN GENERATION
+app.get('/api/agora-token', (req, res) => {
+  const channelName = req.query.channel;
+  const uid = parseInt(req.query.uid) || 0;
+
+  if (!channelName) {
+    return res.status(400).json({ error: 'channel query parameter is required' });
+  }
+
+  if (!AGORA_APP_CERTIFICATE) {
+    // No certificate configured - return empty token for "App ID only" testing mode
+    console.log(`[AGORA TOKEN] No certificate configured, returning empty token for channel: ${channelName}`);
+    return res.json({ token: '', appId: AGORA_APP_ID, channel: channelName, uid });
+  }
+
+  try {
+    const role = RtcRole.PUBLISHER;
+    const expirationTimeInSeconds = 3600; // 1 hour
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      AGORA_APP_ID,
+      AGORA_APP_CERTIFICATE,
+      channelName,
+      uid,
+      role,
+      privilegeExpiredTs
+    );
+
+    console.log(`[AGORA TOKEN] Generated token for channel: ${channelName}, uid: ${uid}`);
+    return res.json({ token, appId: AGORA_APP_ID, channel: channelName, uid });
+  } catch (e) {
+    console.error(`[AGORA TOKEN ERROR] ${e.message}`);
+    return res.status(500).json({ error: 'Token generation failed: ' + e.message });
+  }
 });
 
 // -------------------------------------------------------------
