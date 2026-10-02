@@ -14,7 +14,7 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 const AGORA_APP_ID = process.env.AGORA_APP_ID || '8fad472fea6c40dcaf4bd00b394ad814';
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || '';
+const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || 'beb9712340434846a6c9f3e5d0a5c7e0';
 const APP_SECRET = process.env.APP_SECRET || 'new_stranger_secret_key_2026';
 
 // Configure CORS and Socket.io with ping timeout for aggressive dead connection pruning
