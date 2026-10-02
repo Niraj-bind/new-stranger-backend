@@ -128,13 +128,25 @@ app.post('/api/login', (req, res) => {
 
 // 3. STATS
 app.get('/api/stats', (req, res) => {
-  const liveCount = io.engine.clientsCount;
-  const base = 12400 + liveCount;
-  const males = Math.floor(base * 0.52);
-  const females = base - males;
+  const liveCount = io.engine.clientsCount || 0;
+  let males = 0;
+  let females = 0;
+
+  for (const [id, s] of io.sockets.sockets) {
+    if (s.userGender === 'Female') {
+      females++;
+    } else {
+      males++;
+    }
+  }
+
+  if (liveCount === 0) {
+    males = 0;
+    females = 0;
+  }
 
   return res.json({
-    totalOnline: base,
+    totalOnline: liveCount,
     malesOnline: males,
     femalesOnline: females
   });
@@ -238,8 +250,17 @@ io.on('connection', (socket) => {
   socket.partnerSocket = null;
   socket.currentRoomId = null;
 
-  socket.on('identify', (userId) => {
-    socket.userId = userId;
+  socket.on('identify', (data) => {
+    if (typeof data === 'string') {
+      socket.userId = data;
+      if (db.users[data]) {
+        socket.userGender = db.users[data].gender;
+      }
+    } else if (data && typeof data === 'object') {
+      socket.userId = data.userId;
+      socket.userGender = data.gender || (db.users[data.userId] ? db.users[data.userId].gender : 'Male');
+    }
+    console.log(`[IDENTIFY] Socket ${socket.id} is ${socket.userId} (${socket.userGender})`);
   });
 
   // 1. MATCH REQUEST (Atomic matching loop)
