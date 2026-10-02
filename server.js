@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -7,6 +8,12 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
+
+// Environment Variables
+const PORT = process.env.PORT || 3000;
+const NODE_ENV = process.env.NODE_ENV || 'production';
+const AGORA_APP_ID = process.env.AGORA_APP_ID || '8fad472fea6c40dcaf4bd00b394ad814';
+const APP_SECRET = process.env.APP_SECRET || 'new_stranger_secret_key_2026';
 
 // Configure CORS and Socket.io with ping timeout for aggressive dead connection pruning
 const io = new Server(server, {
@@ -21,8 +28,6 @@ const io = new Server(server, {
 
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
-
-const PORT = process.env.PORT || 3000;
 
 // Persistent Database storage (JSON file)
 const DB_FILE = path.join(__dirname, 'database.json');
@@ -48,10 +53,19 @@ app.get('/', (req, res) => {
     status: 'online',
     service: 'New Stranger Backend API',
     platform: 'Render.com',
+    environment: NODE_ENV,
     onlineUsers: io.engine.clientsCount,
     activeMatches: activeRooms.size,
     queueSize: waitingQueue.length,
+    agoraConfigured: !!AGORA_APP_ID,
     timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/api/config', (req, res) => {
+  res.json({
+    agoraAppId: AGORA_APP_ID,
+    environment: NODE_ENV
   });
 });
 
