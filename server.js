@@ -3,21 +3,25 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const { RtcTokenBuilder, RtcRole } = require('agora-token');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid') || { v4: () => 'id_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36) };
+const { db, run, get, all, initDatabase } = require('./database');
 
 const app = express();
 const server = http.createServer(app);
 
-// Environment Variables
+// Configuration
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
-const AGORA_APP_ID = process.env.AGORA_APP_ID || '8fad472fea6c40dcaf4bd00b394ad814';
-const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || 'beb9712340434846a6c9f3e5d0a5c7e0';
-const APP_SECRET = process.env.APP_SECRET || 'new_stranger_secret_key_2026';
+const JWT_SECRET = process.env.JWT_SECRET || 'connect_dating_secure_jwt_secret_2026';
 
-// Configure CORS and Socket.io with ping timeout for aggressive dead connection pruning
+// Middleware (Express 50MB limit for photo sharing)
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Socket.IO Setup
 const io = new Server(server, {
   cors: {
     origin: '*',
@@ -28,554 +32,634 @@ const io = new Server(server, {
   transports: ['websocket', 'polling']
 });
 
-app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+// Helper for generating unique IDs
+function generateId(prefix = 'usr') {
+  return `${prefix}_${Math.random().toString(36).substring(2, 8)}${Date.now().toString(36).substring(4)}`;
+}
 
-// Persistent Database storage (JSON file)
-const DB_FILE = path.join(__dirname, 'database.json');
-let db = { users: {}, friends: {}, requests: {} };
+// Authentication Middleware
+async function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
 
-if (fs.existsSync(DB_FILE)) {
-  try {
-    db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch (e) {
-    console.error('Error loading database.json, starting with fresh store');
+  // Also support custom x-user-id header for simple resilience
+  const fallbackUserId = req.headers['x-user-id'];
+
+  if (!token && !fallbackUserId) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const user = await get('SELECT id, username, name, gender, age, city, profile_photo, bio, interests FROM users WHERE id = ?', [decoded.id]);
+      if (!user) return res.status(401).json({ error: 'User not found' });
+      req.user = user;
+      return next();
+    } catch (err) {
+      // Fallback if token expired but fallback id exists
+      if (fallbackUserId) {
+        const user = await get('SELECT id, username, name, gender, age, city, profile_photo, bio, interests FROM users WHERE id = ?', [fallbackUserId]);
+        if (user) {
+          req.user = user;
+          return next();
+        }
+      }
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+  }
+
+  if (fallbackUserId) {
+    const user = await get('SELECT id, username, name, gender, age, city, profile_photo, bio, interests FROM users WHERE id = ?', [fallbackUserId]);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+    req.user = user;
+    return next();
   }
 }
 
-function saveDb() {
-  fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), () => {});
-}
-
-// -------------------------------------------------------------
-// Health Check (For Render)
-// -------------------------------------------------------------
+// --------------------------------------------------------------------------
+// HEALTH & INFO
+// --------------------------------------------------------------------------
 app.get('/', (req, res) => {
   res.json({
+    app: 'Connect',
+    tagline: 'Completely Free Dating & Social Connection',
     status: 'online',
-    service: 'New Stranger Backend API',
     platform: 'Render.com',
     environment: NODE_ENV,
-    onlineUsers: io.engine.clientsCount,
-    activeMatches: activeRooms.size,
-    queueSize: waitingQueue.length,
-    agoraConfigured: !!AGORA_APP_ID,
+    activeSockets: io.engine.clientsCount,
     timestamp: new Date().toISOString()
   });
 });
 
-app.get('/api/config', (req, res) => {
-  res.json({
-    agoraAppId: AGORA_APP_ID,
-    environment: NODE_ENV
-  });
-});
+// --------------------------------------------------------------------------
+// 1. AUTHENTICATION & SETUP API
+// --------------------------------------------------------------------------
 
-// 8. AGORA RTC TOKEN GENERATION
-app.get('/api/agora-token', (req, res) => {
-  const channelName = req.query.channel;
-  const uid = parseInt(req.query.uid) || 0;
-
-  if (!channelName) {
-    return res.status(400).json({ error: 'channel query parameter is required' });
-  }
-
-  if (!AGORA_APP_CERTIFICATE) {
-    // No certificate configured - return empty token for "App ID only" testing mode
-    console.log(`[AGORA TOKEN] No certificate configured, returning empty token for channel: ${channelName}`);
-    return res.json({ token: '', appId: AGORA_APP_ID, channel: channelName, uid });
-  }
-
+// Register User (Must be 18+)
+app.post('/api/register', async (req, res) => {
   try {
-    const role = RtcRole.PUBLISHER;
-    const expirationTimeInSeconds = 3600; // 1 hour
-    const currentTimestamp = Math.floor(Date.now() / 1000);
-    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+    const { username, password, name, gender, age, city, profilePhoto, bio, interests } = req.body;
 
-    const token = RtcTokenBuilder.buildTokenWithUid(
-      AGORA_APP_ID,
-      AGORA_APP_CERTIFICATE,
-      channelName,
-      uid,
-      role,
-      privilegeExpiredTs
-    );
-
-    console.log(`[AGORA TOKEN] Generated token for channel: ${channelName}, uid: ${uid}`);
-    return res.json({ token, appId: AGORA_APP_ID, channel: channelName, uid });
-  } catch (e) {
-    console.error(`[AGORA TOKEN ERROR] ${e.message}`);
-    return res.status(500).json({ error: 'Token generation failed: ' + e.message });
-  }
-});
-
-// -------------------------------------------------------------
-// REST API ENDPOINTS
-// -------------------------------------------------------------
-
-function generateUniqueUserId() {
-  const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  let id = '';
-  do {
-    id = '';
-    for (let i = 0; i < 6; i++) {
-      id += chars.charAt(Math.floor(Math.random() * chars.length));
+    if (!username || !password || !name || !gender || !age || !city) {
+      return res.status(400).json({ error: 'All primary profile fields (username, password, name, gender, age, city) are required' });
     }
-  } while (db.users[id]);
-  return id;
-}
 
-// 1. REGISTER
-app.post('/api/register', (req, res) => {
-  const { name, password, age, gender, orientation } = req.body;
-  if (!name || !password) {
-    return res.status(400).json({ error: 'Name and password are required' });
-  }
+    const cleanUsername = username.trim().toLowerCase();
+    const cleanAge = parseInt(age, 10);
 
-  const userId = generateUniqueUserId();
-
-  db.users[userId] = {
-    id: userId,
-    name,
-    password,
-    age: parseInt(age) || 18,
-    gender: gender || 'Other',
-    orientation: orientation || 'Straight',
-    createdAt: new Date().toISOString()
-  };
-
-  db.friends[userId] = [];
-  db.requests[userId] = [];
-  saveDb();
-
-  console.log(`[REGISTER] Created user ${userId} (${name})`);
-
-  return res.json({
-    success: true,
-    message: 'User registered successfully',
-    userId,
-    user: db.users[userId]
-  });
-});
-
-// 2. LOGIN
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  if (!username) return res.status(400).json({ error: 'Username is required' });
-  const rawId = username.trim();
-  const upperId = rawId.toUpperCase();
-  const user = db.users[upperId] || db.users[rawId];
-
-  if (!user || user.password !== password) {
-    return res.status(401).json({ error: 'Invalid User ID or Password' });
-  }
-
-  return res.json({
-    success: true,
-    message: 'Login successful',
-    user: {
-      id: user.id,
-      name: user.name,
-      gender: user.gender,
-      orientation: user.orientation
+    if (isNaN(cleanAge) || cleanAge < 18) {
+      return res.status(400).json({ error: 'Users must be at least 18 years old.' });
     }
-  });
-});
 
-// 3. STATS
-app.get('/api/stats', (req, res) => {
-  const liveCount = io.engine.clientsCount || 0;
-  let males = 0;
-  let females = 0;
-
-  for (const [id, s] of io.sockets.sockets) {
-    if (s.userGender === 'Female') {
-      females++;
-    } else {
-      males++;
+    // Check if username already exists
+    const existing = await get('SELECT id FROM users WHERE username = ?', [cleanUsername]);
+    if (existing) {
+      return res.status(400).json({ error: 'Username already taken. Please choose another.' });
     }
-  }
 
-  if (liveCount === 0) {
-    males = 0;
-    females = 0;
-  }
+    const userId = generateId('usr');
+    const passwordHash = await bcrypt.hash(password, 10);
+    const interestsJson = typeof interests === 'string' ? interests : JSON.stringify(interests || []);
 
-  return res.json({
-    totalOnline: liveCount,
-    malesOnline: males,
-    femalesOnline: females
-  });
-});
+    await run(`
+      INSERT INTO users (id, username, password_hash, name, gender, age, city, profile_photo, bio, interests)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      userId,
+      cleanUsername,
+      passwordHash,
+      name.trim(),
+      gender,
+      cleanAge,
+      city.trim(),
+      profilePhoto || '',
+      bio ? bio.trim() : '',
+      interestsJson
+    ]);
 
-// 4. FRIEND REQUEST
-app.post('/api/friends/request', (req, res) => {
-  const fromUserId = (req.body.fromUserId || '').trim().toUpperCase();
-  const toUserId = (req.body.toUserId || '').trim().toUpperCase();
+    const createdUser = await get(`
+      SELECT id, username, name, gender, age, city, profile_photo, bio, interests, created_at
+      FROM users WHERE id = ?
+    `, [userId]);
 
-  if (!fromUserId || !toUserId) {
-    return res.status(400).json({ error: 'fromUserId and toUserId are required' });
-  }
+    const token = jwt.sign({ id: userId, username: cleanUsername }, JWT_SECRET, { expiresIn: '90d' });
 
-  if (fromUserId === toUserId) {
-    return res.status(400).json({ error: 'Aap khud ko friend request nahi bhej sakte' });
-  }
-
-  // Ensure structures exist for both users (handles server restart/ephemeral container)
-  if (!db.users[fromUserId]) {
-    db.users[fromUserId] = { id: fromUserId, name: fromUserId, gender: 'Other' };
-    db.friends[fromUserId] = db.friends[fromUserId] || [];
-    db.requests[fromUserId] = db.requests[fromUserId] || [];
-  }
-  if (!db.users[toUserId]) {
-    db.users[toUserId] = { id: toUserId, name: toUserId, gender: 'Other' };
-    db.friends[toUserId] = db.friends[toUserId] || [];
-    db.requests[toUserId] = db.requests[toUserId] || [];
-  }
-
-  db.friends[fromUserId] = db.friends[fromUserId] || [];
-  if (db.friends[fromUserId].includes(toUserId)) {
-    return res.status(400).json({ error: `${toUserId} already aapka friend hai` });
-  }
-
-  db.requests[toUserId] = db.requests[toUserId] || [];
-  if (!db.requests[toUserId].includes(fromUserId)) {
-    db.requests[toUserId].push(fromUserId);
-    saveDb();
-  }
-
-  // Real-time socket event to the recipient's phone!
-  io.to(`user_${toUserId}`).emit('incoming_friend_request', { fromUserId });
-  console.log(`[FRIEND REQUEST] ${fromUserId} -> ${toUserId}`);
-
-  return res.json({ success: true, message: `Friend request bhej di gayi: ${toUserId} 🚀` });
-});
-
-// 5. ACCEPT REQUEST
-app.post('/api/friends/accept', (req, res) => {
-  const userId = (req.body.userId || '').trim().toUpperCase();
-  const targetId = (req.body.targetId || '').trim().toUpperCase();
-
-  if (!userId || !targetId) {
-    return res.status(400).json({ error: 'userId and targetId are required' });
-  }
-
-  // Ensure structures exist
-  if (!db.users[userId]) db.users[userId] = { id: userId, name: userId };
-  if (!db.users[targetId]) db.users[targetId] = { id: targetId, name: targetId };
-
-  db.requests[userId] = (db.requests[userId] || []).filter(id => id !== targetId);
-  db.friends[userId] = db.friends[userId] || [];
-  db.friends[targetId] = db.friends[targetId] || [];
-
-  if (!db.friends[userId].includes(targetId)) db.friends[userId].push(targetId);
-  if (!db.friends[targetId].includes(userId)) db.friends[targetId].push(userId);
-
-  saveDb();
-
-  // Real-time socket events to both phones!
-  io.to(`user_${userId}`).emit('friend_accepted', { friendId: targetId });
-  io.to(`user_${targetId}`).emit('friend_accepted', { friendId: userId });
-
-  console.log(`[FRIEND ACCEPTED] ${userId} <-> ${targetId}`);
-  return res.json({ success: true, friends: db.friends[userId] });
-});
-
-// 6. DECLINE REQUEST
-app.post('/api/friends/decline', (req, res) => {
-  const userId = (req.body.userId || '').trim().toUpperCase();
-  const targetId = (req.body.targetId || '').trim().toUpperCase();
-
-  if (userId) {
-    db.requests[userId] = (db.requests[userId] || []).filter(id => id !== targetId);
-    saveDb();
-  }
-
-  return res.json({ success: true, message: 'Request declined' });
-});
-
-// 7. GET FRIENDS & REQUESTS
-app.get('/api/friends/:userId', (req, res) => {
-  const userId = (req.params.userId || '').trim().toUpperCase();
-  if (userId && !db.users[userId]) {
-    db.users[userId] = { id: userId, name: userId };
-    db.friends[userId] = db.friends[userId] || [];
-    db.requests[userId] = db.requests[userId] || [];
-  }
-
-  return res.json({
-    friends: db.friends[userId] || [],
-    incomingRequests: db.requests[userId] || []
-  });
-});
-
-// -------------------------------------------------------------
-// BULLETPROOF 1-ON-1 REAL-TIME MATCHMAKING & RELIABLE MESSAGING
-// -------------------------------------------------------------
-
-// Waiting queue storing socket instances
-let waitingQueue = [];
-
-// Active 1-on-1 rooms map: roomId -> { user1: socket, user2: socket }
-const activeRooms = new Map();
-
-// Helper: Disconnect from partner safely and reset state
-function endPairing(socket, reason = 'partner_left') {
-  const roomId = socket.currentRoomId;
-  const partnerSocket = socket.partnerSocket;
-
-  // Clean current socket
-  socket.state = 'IDLE';
-  socket.partnerSocket = null;
-  socket.currentRoomId = null;
-
-  if (roomId) {
-    socket.leave(roomId);
-    activeRooms.delete(roomId);
-  }
-
-  // Clean partner socket
-  if (partnerSocket && partnerSocket.connected) {
-    partnerSocket.state = 'IDLE';
-    partnerSocket.partnerSocket = null;
-    partnerSocket.currentRoomId = null;
-    if (roomId) partnerSocket.leave(roomId);
-
-    partnerSocket.emit('stranger_disconnected', { reason });
-    console.log(`[PAIRING ENDED] ${socket.id} separated from ${partnerSocket.id}`);
-  }
-}
-
-// Helper: Prune waiting queue of dead sockets
-function cleanQueue() {
-  waitingQueue = waitingQueue.filter(s => s && s.connected && s.state === 'WAITING');
-}
-
-io.on('connection', (socket) => {
-  console.log(`[CONNECT] User connected: ${socket.id}`);
-  socket.state = 'IDLE'; // States: 'IDLE', 'WAITING', 'MATCHED'
-  socket.partnerSocket = null;
-  socket.currentRoomId = null;
-
-  socket.on('identify', (data) => {
-    let uId = '';
-    let uGender = 'Male';
-    if (typeof data === 'string') {
-      uId = data;
-      if (db.users[data]) {
-        uGender = db.users[data].gender;
+    console.log(`[AUTH] Registered new user: ${cleanUsername} (${userId})`);
+    return res.status(201).json({
+      success: true,
+      token,
+      user: {
+        ...createdUser,
+        interests: JSON.parse(createdUser.interests || '[]')
       }
-    } else if (data && typeof data === 'object') {
-      uId = data.userId || '';
-      uGender = data.gender || (db.users[uId] ? db.users[uId].gender : 'Male');
-    }
-    socket.userId = (uId || '').toUpperCase();
-    socket.userGender = uGender;
-    socket.join(`user_${socket.userId}`);
-
-    if (socket.userId && !db.users[socket.userId]) {
-      db.users[socket.userId] = {
-        id: socket.userId,
-        name: socket.userId,
-        gender: socket.userGender,
-        createdAt: new Date().toISOString()
-      };
-      db.friends[socket.userId] = db.friends[socket.userId] || [];
-      db.requests[socket.userId] = db.requests[socket.userId] || [];
-      saveDb();
-    }
-
-    console.log(`[IDENTIFY] Socket ${socket.id} is ${socket.userId} (${socket.userGender})`);
-  });
-
-  // 1. MATCH REQUEST (Atomic matching loop)
-  socket.on('find_match', (data = {}) => {
-    // If socket is already in a match, cleanly terminate the old match first
-    if (socket.state === 'MATCHED') {
-      endPairing(socket, 'new_match_requested');
-    }
-
-    // Remove this socket if it was already in waiting queue
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
-    cleanQueue();
-
-    let matchedPartner = null;
-
-    // Search for a valid, currently waiting partner
-    while (waitingQueue.length > 0) {
-      const candidate = waitingQueue.shift();
-
-      // STRICT VALIDATION: Candidate must be connected, in WAITING state, and NOT the same socket
-      if (
-        candidate &&
-        candidate.connected &&
-        candidate.state === 'WAITING' &&
-        candidate.id !== socket.id
-      ) {
-        matchedPartner = candidate;
-        break;
-      }
-    }
-
-    if (matchedPartner) {
-      // ATOMIC PAIRING: Set states immediately before any async ops
-      socket.state = 'MATCHED';
-      matchedPartner.state = 'MATCHED';
-
-      const roomId = `room_${socket.id}_${matchedPartner.id}_${Date.now()}`;
-      socket.currentRoomId = roomId;
-      matchedPartner.currentRoomId = roomId;
-
-      socket.partnerSocket = matchedPartner;
-      matchedPartner.partnerSocket = socket;
-
-      socket.join(roomId);
-      matchedPartner.join(roomId);
-
-      activeRooms.set(roomId, { user1: socket, user2: matchedPartner });
-
-      const nameA = socket.userId || 'Stranger';
-      const nameB = matchedPartner.userId || 'Stranger';
-
-      // Notify User A
-      socket.emit('match_found', {
-        roomId,
-        partnerId: matchedPartner.id,
-        partnerName: nameB
-      });
-
-      // Notify User B
-      matchedPartner.emit('match_found', {
-        roomId,
-        partnerId: socket.id,
-        partnerName: nameA
-      });
-
-      console.log(`[MATCH SUCCESS] Room ${roomId} created between ${socket.id} (${nameA}) and ${matchedPartner.id} (${nameB})`);
-    } else {
-      // Put in queue
-      socket.state = 'WAITING';
-      waitingQueue.push(socket);
-      socket.emit('waiting_for_match');
-      console.log(`[WAITING] Socket ${socket.id} queued. Total queue: ${waitingQueue.length}`);
-    }
-  });
-
-  // 2. RELIABLE MESSAGE SEND WITH ACKNOWLEDGEMENT (Guaranteed Delivery)
-  socket.on('send_message', (payload, ackCallback) => {
-    const partner = socket.partnerSocket;
-
-    // Validation 1: Verify socket is currently matched
-    if (socket.state !== 'MATCHED' || !partner) {
-      if (typeof ackCallback === 'function') {
-        ackCallback({
-          status: 'error',
-          error: 'No active stranger connection. Please match first.'
-        });
-      }
-      return;
-    }
-
-    // Validation 2: Verify partner is still connected
-    if (!partner.connected) {
-      endPairing(socket, 'partner_lost_connection');
-      if (typeof ackCallback === 'function') {
-        ackCallback({
-          status: 'error',
-          error: 'Stranger disconnected. Message could not be sent.'
-        });
-      }
-      return;
-    }
-
-    const messageData = {
-      id: payload.id || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      text: payload.text || null,
-      imageBase64: payload.imageBase64 || null,
-      isPhoto: !!payload.isPhoto,
-      from: socket.userId || 'Stranger',
-      timestamp: new Date().toISOString()
-    };
-
-    // DIRECT EMISSION TO PARTNER: No broadcast loss!
-    partner.emit('receive_message', messageData);
-
-    // Send instant success delivery receipt back to the sender
-    if (typeof ackCallback === 'function') {
-      ackCallback({
-        status: 'delivered',
-        messageId: messageData.id,
-        timestamp: messageData.timestamp
-      });
-    }
-  });
-
-  // 3. TYPING INDICATOR (Direct to partner)
-  socket.on('typing', ({ isTyping }) => {
-    if (socket.partnerSocket && socket.partnerSocket.connected) {
-      socket.partnerSocket.emit('stranger_typing', { isTyping: !!isTyping });
-    }
-  });
-
-  // 4. LEAVE / CANCEL MATCH (Explicit clean separation)
-  socket.on('leave_match', () => {
-    console.log(`[LEAVE MATCH] ${socket.id} called leave_match`);
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
-    endPairing(socket, 'user_left');
-  });
-
-  // 5. DISCONNECT HANDLER
-  socket.on('disconnect', (reason) => {
-    console.log(`[DISCONNECT] Socket ${socket.id} disconnected (${reason})`);
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
-    endPairing(socket, 'disconnected');
-  });
-
-  // 6. WEBRTC SIGNALING FOR CALLS
-  socket.on('call_user', ({ toUserId, signalData, callType }) => {
-    io.emit(`call_incoming_${toUserId}`, {
-      fromUserId: socket.userId,
-      signalData,
-      callType
     });
-  });
+  } catch (error) {
+    console.error('[AUTH ERROR] Registration failed:', error);
+    return res.status(500).json({ error: 'Registration failed: ' + error.message });
+  }
+});
 
-  socket.on('answer_call', ({ toUserId, signalData }) => {
-    io.emit(`call_accepted_${toUserId}`, { signalData });
-  });
-
-  // 7. DIRECT FRIEND-TO-FRIEND MESSAGING
-  socket.on('send_friend_message', (payload, ackCallback) => {
-    const toUserId = (payload.toUserId || '').trim().toUpperCase();
-    if (!toUserId) {
-      if (typeof ackCallback === 'function') {
-        ackCallback({ status: 'error', error: 'Recipient ID required' });
-      }
-      return;
+// Login User
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
     }
 
-    const messageData = {
-      id: payload.id || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      text: payload.text || null,
-      imageBase64: payload.imageBase64 || null,
-      isPhoto: !!payload.isPhoto,
-      from: socket.userId || 'Friend',
-      toUserId: toUserId,
-      timestamp: new Date().toISOString()
-    };
+    const cleanUsername = username.trim().toLowerCase();
+    const user = await get('SELECT * FROM users WHERE username = ?', [cleanUsername]);
 
-    io.to(`user_${toUserId}`).emit('receive_friend_message', messageData);
-    console.log(`[FRIEND MSG] From ${socket.userId} to ${toUserId} (ID: ${messageData.id})`);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
 
-    if (typeof ackCallback === 'function') {
-      ackCallback({
-        status: 'delivered',
-        messageId: messageData.id
-      });
+    const passwordMatch = await bcrypt.compare(password, user.password_hash);
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+
+    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '90d' });
+
+    console.log(`[AUTH] User logged in: ${user.username} (${user.id})`);
+    return res.json({
+      success: true,
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        name: user.name,
+        gender: user.gender,
+        age: user.age,
+        city: user.city,
+        profile_photo: user.profile_photo,
+        bio: user.bio,
+        interests: JSON.parse(user.interests || '[]'),
+        created_at: user.created_at
+      }
+    });
+  } catch (error) {
+    console.error('[AUTH ERROR] Login failed:', error);
+    return res.status(500).json({ error: 'Login failed: ' + error.message });
+  }
+});
+
+// Get Current User Profile
+app.get('/api/me', authenticateToken, async (req, res) => {
+  const user = req.user;
+  return res.json({
+    success: true,
+    user: {
+      ...user,
+      interests: typeof user.interests === 'string' ? JSON.parse(user.interests || '[]') : user.interests
     }
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 New Stranger Server running on port ${PORT}`);
+// Update Profile
+app.put('/api/profile', authenticateToken, async (req, res) => {
+  try {
+    const { name, city, bio, interests, profilePhoto } = req.body;
+    const userId = req.user.id;
+
+    const current = await get('SELECT * FROM users WHERE id = ?', [userId]);
+    if (!current) return res.status(404).json({ error: 'User not found' });
+
+    const newName = name !== undefined ? name.trim() : current.name;
+    const newCity = city !== undefined ? city.trim() : current.city;
+    const newBio = bio !== undefined ? bio.trim() : current.bio;
+    const newInterests = interests !== undefined
+      ? (typeof interests === 'string' ? interests : JSON.stringify(interests))
+      : current.interests;
+    const newPhoto = profilePhoto !== undefined ? profilePhoto : current.profile_photo;
+
+    await run(`
+      UPDATE users
+      SET name = ?, city = ?, bio = ?, interests = ?, profile_photo = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [newName, newCity, newBio, newInterests, newPhoto, userId]);
+
+    const updated = await get('SELECT id, username, name, gender, age, city, profile_photo, bio, interests FROM users WHERE id = ?', [userId]);
+
+    return res.json({
+      success: true,
+      user: {
+        ...updated,
+        interests: JSON.parse(updated.interests || '[]')
+      }
+    });
+  } catch (error) {
+    console.error('[PROFILE ERROR] Update failed:', error);
+    return res.status(500).json({ error: 'Failed to update profile: ' + error.message });
+  }
+});
+
+// --------------------------------------------------------------------------
+// 2. DISCOVER SCREEN API (PAGINATED, OPPOSITE GENDER, STRICT BLOCK EXCLUSION)
+// --------------------------------------------------------------------------
+app.get('/api/profiles', authenticateToken, async (req, res) => {
+  try {
+    const currentUser = req.user;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const offset = (page - 1) * limit;
+
+    // Opposite Gender Determination
+    const userGender = (currentUser.gender || 'Male').toLowerCase();
+    const targetGender = userGender === 'male' ? 'Female' : 'Male';
+
+    // Strict Block System Filter:
+    // Exclude:
+    // 1. Current user
+    // 2. Users blocked by current user
+    // 3. Users who have blocked current user
+    const query = `
+      SELECT id, name, gender, age, city, profile_photo, bio, interests, created_at
+      FROM users
+      WHERE gender = ?
+        AND id != ?
+        AND id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+        AND id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
+      ORDER BY created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM users
+      WHERE gender = ?
+        AND id != ?
+        AND id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+        AND id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
+    `;
+
+    const [rows, countRow] = await Promise.all([
+      all(query, [targetGender, currentUser.id, currentUser.id, currentUser.id, limit, offset]),
+      get(countQuery, [targetGender, currentUser.id, currentUser.id, currentUser.id])
+    ]);
+
+    const total = countRow ? countRow.total : 0;
+    const hasMore = offset + rows.length < total;
+
+    const profiles = rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      gender: r.gender,
+      age: r.age,
+      city: r.city,
+      profile_photo: r.profile_photo,
+      bio: r.bio,
+      interests: JSON.parse(r.interests || '[]'),
+      created_at: r.created_at
+    }));
+
+    return res.json({
+      success: true,
+      page,
+      limit,
+      total,
+      hasMore,
+      targetGender,
+      profiles
+    });
+  } catch (error) {
+    console.error('[DISCOVER ERROR] Failed to fetch profiles:', error);
+    return res.status(500).json({ error: 'Failed to fetch profiles: ' + error.message });
+  }
+});
+
+// Get Full Profile
+app.get('/api/profiles/:id', authenticateToken, async (req, res) => {
+  try {
+    const targetId = req.params.id;
+    const currentUserId = req.user.id;
+
+    // Check if blocked either way
+    const isBlocked = await get(`
+      SELECT 1 FROM blocks
+      WHERE (blocker_id = ? AND blocked_id = ?)
+         OR (blocker_id = ? AND blocked_id = ?)
+    `, [currentUserId, targetId, targetId, currentUserId]);
+
+    if (isBlocked) {
+      return res.status(404).json({ error: 'Profile not found' });
+    }
+
+    const profile = await get(`
+      SELECT id, name, gender, age, city, profile_photo, bio, interests, created_at
+      FROM users WHERE id = ?
+    `, [targetId]);
+
+    if (!profile) {
+      return res.status(404).json({ error: 'Profile not found' });
+    }
+
+    return res.json({
+      success: true,
+      profile: {
+        ...profile,
+        interests: JSON.parse(profile.interests || '[]')
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch profile: ' + error.message });
+  }
+});
+
+// --------------------------------------------------------------------------
+// 3. CONVERSATIONS & DIRECT MESSAGING API (NO LIKES/MATCH GATES)
+// --------------------------------------------------------------------------
+
+// Helper to get or create a deterministic conversation ID
+function getConversationId(u1, u2) {
+  const sorted = [u1, u2].sort();
+  return `conv_${sorted[0]}_${sorted[1]}`;
+}
+
+// Get All Active Conversations
+app.get('/api/conversations', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Fetch conversations where user is participant and neither participant has blocked the other
+    const conversations = await all(`
+      SELECT
+        c.id as conversation_id,
+        c.last_message_text,
+        c.last_message_time,
+        CASE WHEN c.user1_id = ? THEN c.user2_id ELSE c.user1_id END as partner_id,
+        u.name as partner_name,
+        u.gender as partner_gender,
+        u.age as partner_age,
+        u.city as partner_city,
+        u.profile_photo as partner_photo,
+        (SELECT COUNT(*) FROM messages m
+         WHERE m.conversation_id = c.id
+           AND m.receiver_id = ?
+           AND m.read_at IS NULL) as unread_count
+      FROM conversations c
+      JOIN users u ON u.id = (CASE WHEN c.user1_id = ? THEN c.user2_id ELSE c.user1_id END)
+      WHERE (c.user1_id = ? OR c.user2_id = ?)
+        AND u.id NOT IN (SELECT blocked_id FROM blocks WHERE blocker_id = ?)
+        AND u.id NOT IN (SELECT blocker_id FROM blocks WHERE blocked_id = ?)
+      ORDER BY c.last_message_time DESC
+    `, [userId, userId, userId, userId, userId, userId, userId]);
+
+    return res.json({
+      success: true,
+      conversations
+    });
+  } catch (error) {
+    console.error('[CONVERSATIONS ERROR]', error);
+    return res.status(500).json({ error: 'Failed to fetch conversations: ' + error.message });
+  }
+});
+
+// Get Messages in a Conversation
+app.get('/api/conversations/:id/messages', authenticateToken, async (req, res) => {
+  try {
+    const conversationId = req.params.id;
+    const userId = req.user.id;
+
+    const conv = await get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
+    if (!conv || (conv.user1_id !== userId && conv.user2_id !== userId)) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    const partnerId = conv.user1_id === userId ? conv.user2_id : conv.user1_id;
+
+    // Verify block status
+    const isBlocked = await get(`
+      SELECT 1 FROM blocks
+      WHERE (blocker_id = ? AND blocked_id = ?)
+         OR (blocker_id = ? AND blocked_id = ?)
+    `, [userId, partnerId, partnerId, userId]);
+
+    if (isBlocked) {
+      return res.status(403).json({ error: 'Conversation is inaccessible due to block' });
+    }
+
+    // Mark unread messages as read
+    await run(`
+      UPDATE messages
+      SET read_at = CURRENT_TIMESTAMP
+      WHERE conversation_id = ? AND receiver_id = ? AND read_at IS NULL
+    `, [conversationId, userId]);
+
+    const messages = await all(`
+      SELECT id, conversation_id, sender_id, receiver_id, message_type, text, image_url, created_at, read_at
+      FROM messages
+      WHERE conversation_id = ?
+      ORDER BY created_at ASC
+    `, [conversationId]);
+
+    const partner = await get('SELECT id, name, gender, age, city, profile_photo FROM users WHERE id = ?', [partnerId]);
+
+    return res.json({
+      success: true,
+      partner,
+      messages
+    });
+  } catch (error) {
+    console.error('[MESSAGES ERROR]', error);
+    return res.status(500).json({ error: 'Failed to fetch messages: ' + error.message });
+  }
+});
+
+// Send Message (Text or Photo)
+app.post('/api/messages', authenticateToken, async (req, res) => {
+  try {
+    const senderId = req.user.id;
+    const { receiverId, messageType, text, image } = req.body;
+
+    if (!receiverId) {
+      return res.status(400).json({ error: 'receiverId is required' });
+    }
+
+    if (senderId === receiverId) {
+      return res.status(400).json({ error: 'Cannot send message to yourself' });
+    }
+
+    // STRICT BLOCK CHECK
+    const isBlocked = await get(`
+      SELECT 1 FROM blocks
+      WHERE (blocker_id = ? AND blocked_id = ?)
+         OR (blocker_id = ? AND blocked_id = ?)
+    `, [senderId, receiverId, receiverId, senderId]);
+
+    if (isBlocked) {
+      return res.status(403).json({ error: 'Cannot send message: User has been blocked' });
+    }
+
+    const type = messageType === 'photo' ? 'photo' : 'text';
+    const messageText = type === 'photo' ? (text || '📷 Sent a photo') : (text || '').trim();
+    const imageUrl = type === 'photo' ? (image || '') : null;
+
+    if (type === 'text' && !messageText) {
+      return res.status(400).json({ error: 'Message text cannot be empty' });
+    }
+
+    const convId = getConversationId(senderId, receiverId);
+    const sorted = [senderId, receiverId].sort();
+    const user1 = sorted[0];
+    const user2 = sorted[1];
+
+    // Ensure conversation exists
+    await run(`
+      INSERT INTO conversations (id, user1_id, user2_id, last_message_text, last_message_time)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(user1_id, user2_id) DO UPDATE SET
+        last_message_text = excluded.last_message_text,
+        last_message_time = CURRENT_TIMESTAMP
+    `, [convId, user1, user2, messageText]);
+
+    const msgId = generateId('msg');
+    await run(`
+      INSERT INTO messages (id, conversation_id, sender_id, receiver_id, message_type, text, image_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [msgId, convId, senderId, receiverId, type, messageText, imageUrl]);
+
+    const insertedMessage = await get('SELECT * FROM messages WHERE id = ?', [msgId]);
+
+    // Broadcast Real-time event via Socket.IO to receiver's room
+    io.to(`user_${receiverId}`).emit('new_message', {
+      message: insertedMessage,
+      sender: {
+        id: req.user.id,
+        name: req.user.name,
+        profile_photo: req.user.profile_photo
+      }
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: insertedMessage
+    });
+  } catch (error) {
+    console.error('[SEND MESSAGE ERROR]', error);
+    return res.status(500).json({ error: 'Failed to send message: ' + error.message });
+  }
+});
+
+// --------------------------------------------------------------------------
+// 4. STRICT BLOCK SYSTEM API (DATABASE ENFORCED)
+// --------------------------------------------------------------------------
+
+// Block a user
+app.post('/api/blocks', authenticateToken, async (req, res) => {
+  try {
+    const blockerId = req.user.id;
+    const { blockedId } = req.body;
+
+    if (!blockedId) {
+      return res.status(400).json({ error: 'blockedId is required' });
+    }
+
+    if (blockerId === blockedId) {
+      return res.status(400).json({ error: 'Cannot block yourself' });
+    }
+
+    await run(`
+      INSERT OR IGNORE INTO blocks (blocker_id, blocked_id)
+      VALUES (?, ?)
+    `, [blockerId, blockedId]);
+
+    // Real-time notification to close any open active chat
+    io.to(`user_${blockedId}`).emit('user_blocked', { blockerId });
+    io.to(`user_${blockerId}`).emit('user_blocked', { blockedId });
+
+    console.log(`[BLOCK] User ${blockerId} blocked ${blockedId}`);
+    return res.json({
+      success: true,
+      message: 'User blocked successfully'
+    });
+  } catch (error) {
+    console.error('[BLOCK ERROR]', error);
+    return res.status(500).json({ error: 'Failed to block user: ' + error.message });
+  }
+});
+
+// Unblock a user
+app.delete('/api/blocks/:id', authenticateToken, async (req, res) => {
+  try {
+    const blockerId = req.user.id;
+    const blockedId = req.params.id;
+
+    await run(`
+      DELETE FROM blocks
+      WHERE blocker_id = ? AND blocked_id = ?
+    `, [blockerId, blockedId]);
+
+    console.log(`[UNBLOCK] User ${blockerId} unblocked ${blockedId}`);
+    return res.json({
+      success: true,
+      message: 'User unblocked successfully'
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to unblock user: ' + error.message });
+  }
+});
+
+// Get Blocked Users List
+app.get('/api/blocks', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const blockedUsers = await all(`
+      SELECT b.blocked_id as id, u.name, u.city, u.profile_photo, b.created_at as blocked_at
+      FROM blocks b
+      JOIN users u ON u.id = b.blocked_id
+      WHERE b.blocker_id = ?
+      ORDER BY b.created_at DESC
+    `, [userId]);
+
+    return res.json({
+      success: true,
+      blockedUsers
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch blocked users: ' + error.message });
+  }
+});
+
+// --------------------------------------------------------------------------
+// 5. SOCKET.IO REAL-TIME COMMUNICATION
+// --------------------------------------------------------------------------
+io.on('connection', (socket) => {
+  console.log(`[SOCKET CONNECT] ${socket.id}`);
+
+  socket.on('identify', (userId) => {
+    if (userId) {
+      const cleanId = String(userId).trim();
+      socket.userId = cleanId;
+      socket.join(`user_${cleanId}`);
+      console.log(`[SOCKET IDENTIFY] User ${cleanId} joined room user_${cleanId}`);
+    }
+  });
+
+  socket.on('typing', ({ receiverId, isTyping }) => {
+    if (socket.userId && receiverId) {
+      io.to(`user_${receiverId}`).emit('partner_typing', {
+        senderId: socket.userId,
+        isTyping: !!isTyping
+      });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`[SOCKET DISCONNECT] ${socket.id} (${socket.userId || 'guest'})`);
+  });
+});
+
+// Start Server
+initDatabase().then(() => {
+  server.listen(PORT, () => {
+    console.log(`=========================================`);
+    console.log(`  CONNECT BACKEND SERVER RUNNING         `);
+    console.log(`  Port: ${PORT} | Env: ${NODE_ENV}       `);
+    console.log(`=========================================`);
+  });
+}).catch((err) => {
+  console.error('[DB FATAL] Failed to initialize database:', err);
+  process.exit(1);
 });
